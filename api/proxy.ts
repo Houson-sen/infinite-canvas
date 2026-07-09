@@ -1,5 +1,12 @@
 export const config = { runtime: "edge" };
 
+// 仅转发这些请求头，避免浏览器 origin/referer 等头干扰目标 API 的鉴权
+const ALLOWED_HEADERS = new Set([
+    "authorization",
+    "content-type",
+    "accept",
+]);
+
 export default async function handler(req: Request): Promise<Response> {
     if (req.method === "OPTIONS") {
         return new Response(null, {
@@ -22,23 +29,27 @@ export default async function handler(req: Request): Promise<Response> {
         });
     }
 
-    const headers = new Headers(req.headers);
-    headers.delete("host");
-    headers.delete("content-length");
-    for (const key of [...headers.keys()]) {
-        if (key.startsWith("x-forwarded") || key.startsWith("x-vercel") || key.startsWith("x-real-ip")) {
-            headers.delete(key);
+    // 用白名单构建转发头，丢弃浏览器特有的 origin/referer/sec-* 等
+    const forwardHeaders = new Headers();
+    for (const [key, value] of req.headers.entries()) {
+        if (ALLOWED_HEADERS.has(key.toLowerCase())) {
+            forwardHeaders.set(key, value);
         }
     }
 
     try {
-        const fetchOptions: RequestInit & { duplex?: string } = {
+        const fetchOptions: RequestInit = {
             method: req.method,
-            headers,
+            headers: forwardHeaders,
         };
+
+        // 缓冲完整 body 并设置 content-length，避免 chunked encoding 被目标服务器拒绝
         if (req.method !== "GET" && req.method !== "HEAD") {
-            fetchOptions.body = req.body;
-            fetchOptions.duplex = "half";
+            const bodyBuffer = await req.arrayBuffer();
+            if (bodyBuffer.byteLength > 0) {
+                fetchOptions.body = bodyBuffer;
+                forwardHeaders.set("content-length", String(bodyBuffer.byteLength));
+            }
         }
 
         const response = await fetch(target, fetchOptions);
@@ -54,9 +65,12 @@ export default async function handler(req: Request): Promise<Response> {
             headers: responseHeaders,
         });
     } catch (error) {
-        return new Response(JSON.stringify({ error: error instanceof Error ? error.message : "Proxy request failed" }), {
-            status: 502,
-            headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
-        });
+        return new Response(
+            JSON.stringify({ error: error instanceof Error ? error.message : "Proxy request failed" }),
+            {
+                status: 502,
+                headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
+            }
+        );
     }
 }
