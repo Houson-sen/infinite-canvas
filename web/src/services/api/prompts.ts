@@ -189,7 +189,12 @@ function firstMatch(value: string, pattern: RegExp) {
 function extractMarkdownImages(baseUrl: string, markdown: string) {
     const markdownImages = Array.from(markdown.matchAll(/!\[[^\]]*]\(([^)]+)\)/g), (match) => absoluteImage(baseUrl, match[1]));
     const htmlImages = Array.from(markdown.matchAll(/<img[^>]*\bsrc=["']([^"']+)["'][^>]*>/gi), (match) => absoluteImage(baseUrl, match[1]));
-    return [...markdownImages, ...htmlImages].filter(Boolean);
+    return [...markdownImages, ...htmlImages].filter(Boolean).filter((url) => !isBadgeImage(url));
+}
+
+/** 过滤掉 shields.io 等 badge 徽章图，它们不是案例展示图 */
+function isBadgeImage(url: string) {
+    return /img\.shields\.io|badgen\.net|badge\.fury\.io|forthebadge\.com/i.test(url);
 }
 
 function absoluteImage(baseUrl: string, image: string) {
