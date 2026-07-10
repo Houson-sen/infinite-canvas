@@ -1,7 +1,7 @@
-// 使用 Node.js Serverless Function（非 Edge），maxDuration: 60 秒
-// Edge Function 固定 25s 上限，生图 API 常需要 25-40s
+// 使用 Node.js Serverless Function（非 Edge）
+// Hobby 计划支持 maxDuration 最高 300 秒；Edge Function 固定 25s 首字节上限
 export const config = {
-    maxDuration: 60,
+    maxDuration: 300,
     api: { bodyParser: false },
 };
 
