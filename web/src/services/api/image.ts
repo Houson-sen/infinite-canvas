@@ -1,6 +1,7 @@
 import axios from "axios";
 
-import { buildApiUrl, resolveModelRequestConfig, type AiConfig, type ModelChannel } from "@/stores/use-config-store";
+import { buildApiUrl, resolveModelRequestConfig, resolveModelScript, type AiConfig, type ModelChannel } from "@/stores/use-config-store";
+import { normalizePluginImages, runModelPlugin } from "./model-plugin";
 import { nanoid } from "nanoid";
 import { dataUrlToFile } from "@/lib/image-utils";
 import { buildImageReferencePromptText } from "@/lib/image-reference-prompt";
@@ -13,19 +14,19 @@ export type AiTextMessage = {
     content: string | Array<{ type: "text"; text: string } | { type: "image_url"; image_url: { url: string } }>;
 };
 
-export type ResponseToolCall = {
+type ResponseToolCall = {
     id: string;
     type: "function";
     function: { name: string; arguments: string };
     thoughtSignature?: string;
 };
 
-export type ResponseInputMessage =
+type ResponseInputMessage =
     | AiTextMessage
     | { type: "function_call"; call_id: string; name: string; arguments: string; thoughtSignature?: string }
     | { role: "tool"; tool_call_id: string; content: string };
 
-export type ResponseFunctionTool = {
+type ResponseFunctionTool = {
     type: "function";
     function: {
         name: string;
@@ -35,7 +36,7 @@ export type ResponseFunctionTool = {
     };
 };
 
-export type ToolResponseResult = {
+type ToolResponseResult = {
     content: string;
     toolCalls: ResponseToolCall[];
 };
@@ -147,14 +148,19 @@ function resolveSize(quality: string | undefined, ratio: string): string {
     return `${width}x${height}`;
 }
 
-function parseImageRatio(value: string) {
+function parseRatioValue(value: string) {
     const parts = value.split(":");
     if (parts.length !== 2) throw new Error("图像尺寸格式不支持，请使用 auto、9:16 或 1024x1024");
     const w = Number(parts[0]);
     const h = Number(parts[1]);
     if (!Number.isFinite(w) || !Number.isFinite(h) || w <= 0 || h <= 0) throw new Error("图像比例必须是正数，例如 9:16");
-    if (Math.max(w, h) / Math.min(w, h) > IMAGE_MAX_RATIO) throw new Error("图像宽高比不能超过 3:1，请调整尺寸");
     return { width: w, height: h };
+}
+
+function parseImageRatio(value: string) {
+    const ratio = parseRatioValue(value);
+    if (Math.max(ratio.width, ratio.height) / Math.min(ratio.width, ratio.height) > IMAGE_MAX_RATIO) throw new Error("图像宽高比不能超过 3:1，请调整尺寸");
+    return ratio;
 }
 
 function parseImageDimensions(value: string) {
@@ -198,8 +204,8 @@ function closestGeminiAspectRatio(value: string) {
     const ratio = parseImageRatio(value);
     const target = ratio.width / ratio.height;
     return GEMINI_SUPPORTED_RATIOS.reduce((best, item) => {
-        const current = parseImageRatio(item);
-        const bestRatio = parseImageRatio(best);
+        const current = parseRatioValue(item);
+        const bestRatio = parseRatioValue(best);
         return Math.abs(current.width / current.height - target) < Math.abs(bestRatio.width / bestRatio.height - target) ? item : best;
     });
 }
@@ -652,6 +658,25 @@ function parseGeminiImagePayload(payload: GeminiPayload) {
 export async function requestGeneration(config: AiConfig, prompt: string, options?: RequestOptions) {
     const requestConfig = resolveModelRequestConfig(config, config.model || config.imageModel);
     const n = Math.max(1, Math.min(15, Math.floor(Math.abs(Number(config.count)) || 1)));
+    const script = resolveModelScript(config, config.model || config.imageModel);
+    if (script) {
+        const quality = normalizeQuality(config.quality);
+        const requestSize = resolveRequestSize(quality, config.size);
+        try {
+            const result = await runModelPlugin({
+                capability: "image",
+                script,
+                config: requestConfig,
+                prompt: withSystemPrompt(requestConfig, prompt),
+                images: [],
+                params: { size: requestSize, quality, count: n },
+                signal: options?.signal,
+            });
+            return normalizePluginImages(result).map((dataUrl) => ({ id: nanoid(), dataUrl }));
+        } catch (error) {
+            throw new Error(readAxiosError(error, "请求失败"));
+        }
+    }
     if (requestConfig.apiFormat === "gemini") {
         try {
             return await requestGeminiImages(requestConfig, prompt, [], n, options);
@@ -689,6 +714,26 @@ export async function requestEdit(config: AiConfig, prompt: string, references: 
     const requestConfig = resolveModelRequestConfig(config, config.model || config.imageModel);
     const n = Math.max(1, Math.min(15, Math.floor(Math.abs(Number(config.count)) || 1)));
     const requestPrompt = buildImageReferencePromptText(prompt, references);
+    const script = resolveModelScript(config, config.model || config.imageModel);
+    if (script) {
+        const quality = normalizeQuality(config.quality);
+        const requestSize = resolveRequestSize(quality, config.size);
+        const refs = await Promise.all(references.map((image) => imageToDataUrl(image)));
+        try {
+            const result = await runModelPlugin({
+                capability: "image",
+                script,
+                config: requestConfig,
+                prompt: withSystemPrompt(requestConfig, requestPrompt),
+                images: refs,
+                params: { size: requestSize, quality, count: n },
+                signal: options?.signal,
+            });
+            return normalizePluginImages(result).map((dataUrl) => ({ id: nanoid(), dataUrl }));
+        } catch (error) {
+            throw new Error(readAxiosError(error, "请求失败"));
+        }
+    }
     if (requestConfig.apiFormat === "gemini") {
         if (mask) throw new Error("Gemini 调用格式暂不支持蒙版编辑");
         try {
@@ -726,6 +771,24 @@ export async function requestEdit(config: AiConfig, prompt: string, references: 
 
 export async function requestImageQuestion(config: AiConfig, messages: AiTextMessage[], onDelta: (text: string) => void, options?: RequestOptions) {
     const requestConfig = resolveModelRequestConfig(config, config.model || config.textModel);
+    const script = resolveModelScript(config, config.model || config.textModel);
+    if (script) {
+        try {
+            const answer = await runModelPlugin<string>({
+                capability: "text",
+                script,
+                config: requestConfig,
+                messages: withSystemMessage(requestConfig, messages),
+                signal: options?.signal,
+                onDelta,
+            });
+            const text = String(answer ?? "").trim() || "没有返回内容";
+            if (text === "没有返回内容") onDelta(text);
+            return text;
+        } catch (error) {
+            throw new Error(readAxiosError(error, "请求失败"));
+        }
+    }
     try {
         if (requestConfig.apiFormat === "gemini") {
             const answer = (await requestGeminiStreamingResponse(requestConfig, toGeminiBody(requestConfig, messages), onDelta, options)).content || "没有返回内容";
@@ -738,24 +801,6 @@ export async function requestImageQuestion(config: AiConfig, messages: AiTextMes
         }, onDelta, options)).content || "没有返回内容";
         if (answer === "没有返回内容") onDelta(answer);
         return answer;
-    } catch (error) {
-        throw new Error(readAxiosError(error, "请求失败"));
-    }
-}
-
-export async function requestToolResponse(config: AiConfig, messages: ResponseInputMessage[], tools: ResponseFunctionTool[], toolChoice: ToolChoice = "auto", onDelta?: (text: string) => void, options?: RequestOptions): Promise<ToolResponseResult> {
-    const requestConfig = resolveModelRequestConfig(config, config.model || config.textModel);
-    try {
-        if (requestConfig.apiFormat === "gemini") {
-            return await requestGeminiStreamingResponse(requestConfig, toGeminiBody(requestConfig, messages, toGeminiToolOptions(tools, toolChoice)), onDelta, options);
-        }
-        return await requestStreamingResponse(requestConfig, {
-            model: requestConfig.model,
-            input: toResponseInput(withSystemMessage(requestConfig, messages)),
-            tools: tools.map(toResponseTool),
-            tool_choice: toolChoice,
-            parallel_tool_calls: false,
-        }, onDelta, options);
     } catch (error) {
         throw new Error(readAxiosError(error, "请求失败"));
     }
